@@ -1,0 +1,2 @@
+class EnvVarNotSetException(Exception):
+    pass
