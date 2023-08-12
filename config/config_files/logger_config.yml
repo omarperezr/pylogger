@@ -1,5 +1,0 @@
-requests:
-  headers_to_ignore: # Validated as lowercase
-    - authorization
-  body_attrs_to_ignore: # Use routes like 'attr_1.attr_2.*' or 'attr_1.attr_2.attr_3'
-    - email

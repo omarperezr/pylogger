@@ -16,6 +16,6 @@ def fib(n: int):
 
 val = fib(4)
 
-# Logger.info(val)
+Logger.info(val)
 
 print(val)

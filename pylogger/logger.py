@@ -1,49 +1,67 @@
-import functools
+import ast
 import json
 import sys
 import traceback
-from copy import deepcopy
 from datetime import datetime
 from distutils.util import strtobool
-from typing import Callable, List, Optional, Union
+from typing import Callable, Union
 
 import loguru
-from django.http import HttpResponse
-from rest_framework.request import Request
 
-from config.config_provider import ConfigProvider
-from exceptions.http_exception import HTTPException
+from config_manager.config_manager import config_manager
+from config_manager.env_var import EnvVar
 from pylogger import log_levels
+from pylogger.handlers.file_handler import file_handler
+from pylogger.handlers.gcp_handler import get_gcp_handler
 from utils import dates, function_execution_timer, hardware_metrics
-from utils.http_response import is_success_response
-from utils.json_cleaner import JSONCleaner
 
 
 class Logger:
-    _ROUTE_BODY_ATTRS_TO_IGNORE = []
+    """Provides methods to log messages and exceptions at different log levels.
+    It uses the loguru library for logging.
+
+    Attributes:
+        None
+
+    Methods:
+        log_execution_time: A decorator method that logs the execution time of a function.
+        error: Logs an exception at the ERROR log level.
+        warn: Logs an exception at the WARN log level.
+        critical_error: Logs an exception at the CRITICAL log level.
+        info: Logs a custom message at the INFO log level.
+
+    Example usage:
+        Logger.info("Custom message", {"extra_args": {"key": "value"}})
+        @Logger.log_execution_time
+        def my_function():
+            # Function code here
+            pass
+    """
+
+    all_handlers = {
+        "stdout": {"sink": sys.stdout, "format": "<lvl>{message}</lvl>"},
+        "gcp": get_gcp_handler("logger_log_file"),
+        "file": {"sink": file_handler, "format": "<lvl>{message}</lvl>"},
+    }
+
+    handlers_to_use = list()
+    for handler in ast.literal_eval(config_manager.get("Logger", "handlers")):
+        handler_value = all_handlers.get(handler)
+        if handler_value is not None:
+            handlers_to_use.append(handler_value)
 
     _LOGURU_CONFIG = {
-        "handlers": [
-            {"sink": sys.stdout, "format": "<lvl>{message}</lvl>"},
-        ],
+        "handlers": [handler for handler in handlers_to_use],
         "levels": [  # Custom log levels
             {"name": log_levels.WARN, "no": 30, "color": "<yellow><bold>"}
         ],
     }
+    _BEAUTIFY_JSON_LOGS = strtobool(str(EnvVar("BEAUTIFY_JSON_LOGS", "False")))
 
-    _REQUEST_LOGS_ATTR_NAME = "logs"
-    _BEAUTIFY_JSON_LOGS = strtobool(
-        ConfigProvider.get_env_var("BEAUTIFY_JSON_LOGS", str(False))
-    )
-
-    def __init__(self):
-        # loguru.logger.configure(**Logger._LOGURU_CONFIG)
-        loguru.logger.configure(**ConfigProvider.get_logger_config()["loguru"])
+    loguru.logger.configure(**_LOGURU_CONFIG)
 
     @staticmethod
     def log_execution_time(function: Callable) -> Callable:
-        functools.wraps(function)
-
         def wrapper(*args, **kwargs):
             timed_result = function_execution_timer.execute_timed(
                 function, *args, **kwargs
@@ -59,67 +77,25 @@ class Logger:
         return wrapper
 
     @staticmethod
-    def log_request(request: Request, log_body: bool = True) -> None:
-        log = Logger._get_base_log("request", log_levels.INFO, request)
-        log["data"] = {
-            "body": Logger._get_cleaned_request_body(request) if log_body else None
-        }
-        Logger._log(log)
-
-    @staticmethod
-    def log_response(
-        response: HttpResponse,
-        execution_time_ms: int,
-        request: Request,
-        log_body: bool = True,
-    ) -> None:
-        level = log_levels.INFO if is_success_response(response) else log_levels.ERROR
-        log = Logger._get_base_log("response", level, request)
-        log["execution_time_ms"] = execution_time_ms
-        if not is_success_response(response):
-            log["exc_info"] = (
-                getattr(request, "last_exc_info")
-                if hasattr(request, "last_exc_info")
-                else None
-            )
-        log["data"] = {
-            "status_code": response.status_code,
-            "body": response.content.decode("utf-8") if log_body else None,
-            "content_type": response.headers.get("Content-Type"),
-            "request_body": Logger._get_cleaned_request_body(request)
-            if not is_success_response(response)
-            else None,
-        }
-        Logger._log(log)
-
-    @staticmethod
-    def _log_exception(
-        exception: Exception, type: str, level: str, request: Request = None
-    ) -> None:
-        log = Logger._get_base_log(type, level, request)
+    def _log_exception(exception: Exception, type: str, level: str) -> None:
+        log = Logger._get_base_log(type, level)
         log["exc_info"] = traceback.format_exc()
-        # Store last exception stack trace in request to obtain it in response
-        Logger._register_last_exception(log["exc_info"], request)
         log["message"] = str(exception)
         log["data"] = {"exception_type": exception.__class__.__name__}
-        if isinstance(exception, HTTPException):
-            log["data"]["status_code"] = exception.status_code
         Logger._log(log)
 
     @staticmethod
-    def error(exception: Exception, request: Request = None) -> None:
-        Logger._log_exception(exception, "error", log_levels.ERROR, request)
+    def error(exception: Exception) -> None:
+        Logger._log_exception(exception, "error", log_levels.ERROR)
 
     @staticmethod
-    def warn(exception: Exception, request: Request = None) -> None:
-        Logger._log_exception(exception, "warn", log_levels.WARN, request)
+    def warn(exception: Exception) -> None:
+        Logger._log_exception(exception, "warn", log_levels.WARN)
 
     @staticmethod
-    def critical_error(exception: Exception, request: Request = None) -> None:
-        log = Logger._get_base_log("critical_error", log_levels.CRITICAL, request)
+    def critical_error(exception: Exception) -> None:
+        log = Logger._get_base_log("critical_error", log_levels.CRITICAL)
         log["exc_info"] = traceback.format_exc()
-        # Store last exception stack trace in request to obtain it in response
-        Logger._register_last_exception(log["exc_info"], request)
         log["message"] = str(exception)
         log["data"] = {"exception_type": exception.__class__.__name__}
         Logger._log(log)
@@ -133,7 +109,10 @@ class Logger:
 
     @staticmethod
     def _log_function_execution_time(
-        function: Callable, start: datetime, end: datetime, execution_time_ms: int
+        function: Callable,
+        start: datetime,
+        end: datetime,
+        execution_time_ms: int,
     ) -> None:
         log = Logger._get_base_log("execution_time", log_levels.INFO)
         log["execution_time_ms"] = execution_time_ms
@@ -151,13 +130,13 @@ class Logger:
         Logger._register_log(log)
 
     @staticmethod
-    def _get_base_log(log_type: str, level: str, request: Request = None) -> dict:
+    def _get_base_log(log_type: str, level: str) -> dict:
         base_log = {
-            "project": ConfigProvider.get_env_var("PROJECT"),
-            "version": ConfigProvider.get_env_var("PROJECT_VERSION"),
-            "repository": ConfigProvider.get_env_var("PROJECT_REPOSITORY"),
-            "environment": ConfigProvider.get_env_var("ENVIRONMENT"),
-            "service": ConfigProvider.get_env_var("SERVICE"),
+            "project": str(EnvVar("PROJECT")),
+            "version": str(EnvVar("PROJECT_VERSION")),
+            "repository": str(EnvVar("PROJECT_REPOSITORY")),
+            "environment": str(EnvVar("ENVIRONMENT")),
+            "service": str(EnvVar("SERVICE")),
             "num_cpu_cores": hardware_metrics.get_available_cpu_count(),
             "type": log_type,
             "timestamp": Logger._get_timestamp(),
@@ -165,38 +144,7 @@ class Logger:
             "data": {},
         }
 
-        if request:
-            base_log["request"] = Logger._get_request_info(request)
-
         return base_log
-
-    @staticmethod
-    def _get_request_info(request: Request) -> dict:
-        return {
-            "request_id": Logger._get_request_id(request),
-            "user_id": Logger._get_user_id(request),
-            "user_roles": Logger._get_user_role(request),
-            "full_path": request.get_full_url(),
-            "http_method": request.method,
-            "content_type": request.content_type,
-            "headers": Logger._clean_request_headers(dict(request.headers)),
-        }
-
-    @staticmethod
-    def _get_user_id(request: Request) -> Optional[str]:
-        if not hasattr(request, "authenticated_user") or not request.authenticated_user:
-            return None
-        return request.authenticated_user.user_id
-
-    @staticmethod
-    def _get_user_role(request: Request) -> Optional[str]:
-        if (
-            not hasattr(request, "authenticated_user")
-            or not request.authenticated_user
-            or not request.authenticated_user.role
-        ):
-            return None
-        return request.authenticated_user.role.name
 
     @staticmethod
     def _get_json_indent() -> Union[int, None]:
@@ -208,72 +156,6 @@ class Logger:
             json_log["levelname"],
             json.dumps(json_log, indent=Logger._get_json_indent()),
         )
-
-    @staticmethod
-    def register_route_body_attributes_to_ignore(
-        http_method: str, path: str, attrs_to_ignore: List[str]
-    ) -> None:
-        Logger._ROUTE_BODY_ATTRS_TO_IGNORE.append(
-            {
-                "http_method": http_method,
-                "path": path,
-                "attrs_to_ignore": attrs_to_ignore,
-            }
-        )
-
-    @staticmethod
-    def _get_request_body_attrs_to_ignore(request: Request) -> List[str]:
-        base_attrs_to_ignore = ConfigProvider.get_logger_config()["requests"][
-            "body_attrs_to_ignore"
-        ]
-        for route in Logger._ROUTE_BODY_ATTRS_TO_IGNORE:
-            if route["http_method"].upper() == request.method.upper():
-                return route["attrs_to_ignore"] + [
-                    x for x in base_attrs_to_ignore if x not in route["attrs_to_ignore"]
-                ]
-        return base_attrs_to_ignore or []
-
-    @staticmethod
-    def _register_last_exception(exc_info: str, request: Request = None) -> None:
-        if request:
-            request.last_exc_info = exc_info
-
-    @staticmethod
-    def _get_request_id(request: Request) -> Optional[str]:
-        request_id_header = ConfigProvider.get_env_var("REQUEST_ID_HEADER")
-        if not request_id_header:
-            return None
-        headers = dict(request.headers)
-        return headers.get(request_id_header)
-
-    @staticmethod
-    def _get_cleaned_request_body(request: Request) -> Optional[str]:
-        if not hasattr(request, "_logging_body") or not request._logging_body:
-            return None
-        # If is json body
-        try:
-            raw_body = request._logging_body.decode("utf-8")
-            json_body = json.loads(raw_body)
-            cleaned_json = JSONCleaner.clean_json(
-                json_body, Logger._get_request_body_attrs_to_ignore(request)
-            )
-            return json.dumps(cleaned_json)
-        except Exception as e:
-            Logger.error(e)
-            return request._logging_body
-
-    @staticmethod
-    def _clean_request_headers(headers: dict) -> dict:
-        _headers = deepcopy(headers)
-        lowercase_headers_to_ignore = [
-            x.lower()
-            for x in ConfigProvider.get_logger_config()["requests"]["headers_to_ignore"]
-        ]
-        return {
-            k: v
-            for k, v in _headers.items()
-            if k.lower() not in lowercase_headers_to_ignore
-        }
 
     @staticmethod
     def _get_timestamp() -> str:

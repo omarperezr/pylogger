@@ -5,8 +5,9 @@ from typing import Any, Callable, Dict
 
 def execute_timed(function: Callable, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     """
-    Executes the given function with the provided arguments and returns a dictionary containing the start and end times,
-    the execution time in milliseconds, and the result of the function.
+    Executes the given function with the provided arguments and returns a
+    dictionary containing the start and end times, the execution time
+    in milliseconds, and the result of the function.
 
     Args:
         function: The function to execute.
@@ -14,11 +15,12 @@ def execute_timed(function: Callable, *args: Any, **kwargs: Any) -> Dict[str, An
         **kwargs: Keyword arguments to pass to the function.
 
     Returns:
-        A dictionary containing the start and end times, the execution time in milliseconds, and the result of the function.
+        A dictionary containing the start and end times, the execution time
+        in milliseconds, and the result of the function.
     """
-    start = time.perf_counter()
+    start = time.time()
     result = function(*args, **kwargs)
-    end = time.perf_counter()
+    end = time.time()
     exec_time_ms = int((end - start) * 1000)
     return {
         "start_timestamp": datetime.fromtimestamp(start),
